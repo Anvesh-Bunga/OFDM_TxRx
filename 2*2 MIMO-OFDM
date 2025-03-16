@@ -1,0 +1,154 @@
+clc;
+clear;
+close all;
+
+%% Simulation Parameters
+ENABLE_CFO = 1;                      % Enable carrier frequency offset
+DETECTION_OFFSET = 100;              % Packet detection error
+SNR = 10;                            % Signal-to-Noise Ratio (dB)
+snr_lin = 10^(SNR/20);               % Linear SNR
+TRIGGER_OFFSET_TOL_NS = 3000;        % Trigger time offset tolerance (ns)
+
+%% OFDM Parameters
+PILOT_SUB_CAR_IND = [8 22 44 58];    % Pilot subcarrier indices
+DATA_SUB_CAR_IND = [2:7 9:21 23:27 39:43 45:57 59:64]; % Data subcarrier indices
+NUM_SUB_CAR = 64;                    % Number of subcarriers
+CP_LEN = 16;                         % Cyclic prefix length
+channel_coding = 0.5;                % Coding rate (R = k/n)
+trel_len = 8;                        % Trellis length
+NUM_OFDM_SYMS = 500;                 % Number of OFDM symbols
+MOD_ORDER = 4;                       % Modulation order (4 = 16-QAM)
+NUM_DATA_SYMS = NUM_OFDM_SYMS * length(DATA_SUB_CAR_IND); % Number of data symbols
+
+%% Preamble (STS and LTS)
+% Short Training Sequence (STS)
+short_ts_f = zeros(1, 64);
+short_ts_f(1:27) = [0 0 0 0 -1-1i 0 0 0 -1-1i 0 0 0 1+1i 0 0 0 1+1i 0 0 0 1+1i 0 0 0 1+1i 0 0];
+short_ts_f(39:64) = [0 0 1+1i 0 0 0 -1-1i 0 0 0 1+1i 0 0 0 -1-1i 0 0 0 -1-1i 0 0 0 1+1i 0 0 0];
+short_ts_t = ifft(sqrt(13/6) .* short_ts_f, 64); % Time-domain STS
+short_ts_t = short_ts_t(1:16);
+
+% Long Training Sequence (LTS)
+long_ts_f = [0 1 -1 -1 1 1 -1 1 -1 1 -1 -1 -1 -1 -1 1 1 -1 -1 1 -1 1 -1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 1 1 -1 -1 1 1 -1 1 -1 1 1 1 1 1 1 -1 -1 1 1 -1 1 -1 1 1 1 1];
+long_ts_t = ifft(long_ts_f, 64); % Time-domain LTS
+
+% Preamble (10 STS + 2.5 LTS)
+preamble = [repmat(short_ts_t, 1, 10) long_ts_t(33:64) long_ts_t long_ts_t];
+
+%% Generate Payload (Random Bits)
+num_tx_bits = (NUM_DATA_SYMS * MOD_ORDER - 2 * trel_len) * channel_coding;
+tx_data = randi(2, 1, num_tx_bits) - 1; % Random bits (0s and 1s)
+
+%% Forward Error Correction (Convolutional Encoding)
+trel = poly2trellis(7, [141 133]); % Trellis structure
+tx_code = convenc([tx_data zeros(1, trel_len)], trel); % Convolutional encoding
+
+%% Modulation (16-QAM)
+tx_syms = qammod(tx_code, MOD_ORDER, 'InputType', 'bit', 'UnitAveragePower', true);
+
+%% OFDM Modulation
+tx_syms_mat = reshape(tx_syms, length(DATA_SUB_CAR_IND), NUM_OFDM_SYMS); % Data symbols
+pilots_mat = repmat([1 1 -1 1].', 1, NUM_OFDM_SYMS); % Pilot symbols
+
+% IFFT and Cyclic Prefix
+ifft_input_mat = zeros(NUM_SUB_CAR, NUM_OFDM_SYMS);
+ifft_input_mat(DATA_SUB_CAR_IND, :) = tx_syms_mat;
+ifft_input_mat(PILOT_SUB_CAR_IND, :) = pilots_mat;
+tx_data_mat_t = ifft(ifft_input_mat, NUM_SUB_CAR, 1); % IFFT
+tx_data_mat_t = [tx_data_mat_t(end-CP_LEN+1:end, :); tx_data_mat_t]; % Add CP
+
+% Reshape to time-domain vector
+tx_payload_vec = reshape(tx_data_mat_t, 1, numel(tx_data_mat_t));
+tx_vec_t = [preamble tx_payload_vec]; % Transmit signal
+
+%% Simulate Wireless Channel (SISO)
+if ENABLE_CFO
+    tx_vec_t = tx_vec_t .* exp(-1i * 2 * pi * 1e-4 * (0:length(tx_vec_t)-1)); % Add CFO
+end
+
+% AWGN Channel
+rx_vec_air = tx_vec_t + (1 / snr_lin) * (randn(1, length(tx_vec_t)) + 1i * randn(1, length(tx_vec_t)));
+
+%% Receiver (SISO)
+% Packet Detection and CFO Correction
+% (Same as original SISO code)
+
+% FFT and Channel Equalization
+% (Same as original SISO code)
+
+% Demodulation and BER Calculation
+rx_syms = qamdemod(syms_eq_mat(DATA_SUB_CAR_IND, :), MOD_ORDER, 'OutputType', 'bit', 'UnitAveragePower', true);
+rx_data = vitdec(rx_syms(:).', trel, 7, 'trunc', 'hard'); % Viterbi decoding
+[num_err_bits_siso, ber_siso] = biterr(tx_data, rx_data(1:length(tx_data))); % BER calculation
+
+%% 2x2 MIMO Simulation
+% Generate two independent data streams
+tx_data_ant1 = randi(2, 1, num_tx_bits) - 1;
+tx_data_ant2 = randi(2, 1, num_tx_bits) - 1;
+
+% Encode and modulate each stream
+tx_code_ant1 = convenc([tx_data_ant1 zeros(1, trel_len)], trel);
+tx_code_ant2 = convenc([tx_data_ant2 zeros(1, trel_len)], trel);
+tx_syms_ant1 = qammod(tx_code_ant1, MOD_ORDER, 'InputType', 'bit', 'UnitAveragePower', true);
+tx_syms_ant2 = qammod(tx_code_ant2, MOD_ORDER, 'InputType', 'bit', 'UnitAveragePower', true);
+
+% OFDM Modulation for each antenna
+tx_syms_mat_ant1 = reshape(tx_syms_ant1, length(DATA_SUB_CAR_IND), NUM_OFDM_SYMS);
+tx_syms_mat_ant2 = reshape(tx_syms_ant2, length(DATA_SUB_CAR_IND), NUM_OFDM_SYMS);
+
+% IFFT and Cyclic Prefix
+ifft_input_mat_ant1 = zeros(NUM_SUB_CAR, NUM_OFDM_SYMS);
+ifft_input_mat_ant1(DATA_SUB_CAR_IND, :) = tx_syms_mat_ant1;
+ifft_input_mat_ant1(PILOT_SUB_CAR_IND, :) = pilots_mat;
+tx_data_mat_t_ant1 = ifft(ifft_input_mat_ant1, NUM_SUB_CAR, 1);
+tx_data_mat_t_ant1 = [tx_data_mat_t_ant1(end-CP_LEN+1:end, :); tx_data_mat_t_ant1];
+
+ifft_input_mat_ant2 = zeros(NUM_SUB_CAR, NUM_OFDM_SYMS);
+ifft_input_mat_ant2(DATA_SUB_CAR_IND, :) = tx_syms_mat_ant2;
+ifft_input_mat_ant2(PILOT_SUB_CAR_IND, :) = pilots_mat;
+tx_data_mat_t_ant2 = ifft(ifft_input_mat_ant2, NUM_SUB_CAR, 1);
+tx_data_mat_t_ant2 = [tx_data_mat_t_ant2(end-CP_LEN+1:end, :); tx_data_mat_t_ant2];
+
+% Transmit signals
+tx_vec_t_ant1 = [preamble reshape(tx_data_mat_t_ant1, 1, numel(tx_data_mat_t_ant1))];
+tx_vec_t_ant2 = [preamble reshape(tx_data_mat_t_ant2, 1, numel(tx_data_mat_t_ant2))];
+
+% MIMO Channel
+H = (randn(2, 2) + 1i * randn(2, 2)) / sqrt(2); % Rayleigh fading channel
+rx_vec_air_ant1 = H(1, 1) * tx_vec_t_ant1 + H(1, 2) * tx_vec_t_ant2;
+rx_vec_air_ant2 = H(2, 1) * tx_vec_t_ant1 + H(2, 2) * tx_vec_t_ant2;
+
+% Add AWGN
+rx_vec_air_ant1 = rx_vec_air_ant1 + (1 / snr_lin) * (randn(1, length(tx_vec_t_ant1)) + 1i * randn(1, length(tx_vec_t_ant1)));
+rx_vec_air_ant2 = rx_vec_air_ant2 + (1 / snr_lin) * (randn(1, length(tx_vec_t_ant2)) + 1i * randn(1, length(tx_vec_t_ant2)));
+
+% Receiver (MIMO)
+% (Perform packet detection, CFO correction, channel estimation, and equalization)
+
+% Demodulation and BER Calculation
+% (Similar to SISO, but repeated for each antenna)
+
+% Combine decoded bits from both antennas
+rx_data_mimo = [rx_data_ant1; rx_data_ant2];
+[num_err_bits_mimo, ber_mimo] = biterr([tx_data_ant1; tx_data_ant2], rx_data_mimo);
+
+%% BER Comparison
+disp('BER for SISO:');
+disp(ber_siso);
+disp('BER for 2x2 MIMO:');
+disp(ber_mimo);
+
+% Plot BER vs. SNR (Optional)
+SNR_range = 0:2:20; % Example SNR range
+ber_siso = ...; % BER values for SISO
+ber_mimo = ...; % BER values for MIMO
+
+figure;
+semilogy(SNR_range, ber_siso, 'b-o', 'LineWidth', 2);
+hold on;
+semilogy(SNR_range, ber_mimo, 'r-s', 'LineWidth', 2);
+grid on;
+xlabel('SNR (dB)');
+ylabel('BER');
+title('BER vs. SNR for SISO and 2x2 MIMO');
+legend('SISO', '2x2 MIMO');

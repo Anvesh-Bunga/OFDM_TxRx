@@ -1,3 +1,4 @@
+% OFDM script — full updated version with working modulation / demodulation
 clc
 clear;
 close all;
@@ -19,7 +20,7 @@ trel_len = 8;                                               % bits for trellis t
 NUM_OFDM_SYMS = 500;                                        % Number of OFDM symbols
 MOD_ORDER = 4;                                              % {1,2,4,6} = {BSPK, QPSK, 16-QAM, 64-QAM}
 NUM_DATA_SYMS = NUM_OFDM_SYMS * length(DATA_SUB_CAR_IND);   % Number of data symbols (one per data-bearing subcarrier per OFDM symbol)
-	
+    
 
 %% Preamble
 
@@ -61,13 +62,39 @@ tx_data = double([tx_data zeros(1,trel_len) ]);    % 8 bits padding
 trel = poly2trellis(7, [141 133]);      % Define trellis with constraint length 7 and octal polnomial
 tx_code = convenc(tx_data,trel);        % convultional encoder 
 
-%% modulation
-tx_vec = modulator(tx_code', MOD_ORDER, 1);
+%% ---------- Modulation (REPLACED) ----------
+% MOD_ORDER holds bits per symbol: {1,2,4,6} => {BPSK, QPSK,16-QAM,64-QAM}
+M = 2^MOD_ORDER;                             % constellation size
+% ensure tx_code is a row vector of 0/1
+tx_bits = double(tx_code(:).');              % row vector
+
+% pad bits to multiple of MOD_ORDER if needed
+nBits = length(tx_bits);
+remBits = mod(nBits, MOD_ORDER);
+if remBits ~= 0
+    tx_bits = [tx_bits, zeros(1, MOD_ORDER - remBits)];
+end
+
+% bits -> symbol indices (0..M-1), use left-msb mapping
+bit_groups = reshape(tx_bits, MOD_ORDER, []).';    % each row = one symbol bits (top->MSB)
+sym_idx = bi2de(bit_groups, 'left-msb');           % integers 0..M-1
+
+% modulate
+switch MOD_ORDER
+    case 1  % BPSK
+        tx_vec = pskmod(sym_idx, 2, pi);            % conventional BPSK with pi phase offset
+    case 2  % QPSK
+        tx_vec = pskmod(sym_idx, 4, pi/4);          % pi/4 QPSK (change to 0 if you want standard QPSK)
+    otherwise % M-QAM (16,64,...)
+        tx_vec = qammod(sym_idx, M, 'gray', 'UnitAveragePower', true);
+end
+
 figure
 scatter(real(tx_vec), imag(tx_vec),'filled');
 title('Constellation of transmitted bits');
 xlabel('In-phase'); ylabel('Quadrature-phase');
-% reshape gives a matrix
+
+% reshape into OFDM data matrix as before
 tx_syms_mat = reshape(tx_vec, length(DATA_SUB_CAR_IND), NUM_OFDM_SYMS); %one column per OFDM symbol
 % pilot symbols always BPSK mod
 BPSK_pilots = [1 1 -1 1].';
@@ -232,13 +259,36 @@ sym_pc_corrected_mat = syms_eq_mat .* pilot_phase_corr;
 payload_data_sym_mat = sym_pc_corrected_mat(DATA_SUB_CAR_IND, :);
 final_sym_vec = reshape(payload_data_sym_mat, 1, NUM_DATA_SYMS);
 
-%% Demodulation and  viterbi decoder
+%% ---------- Demodulation (REPLACED) ----------
 figure
 scatter(real(final_sym_vec), imag(final_sym_vec),'filled');
 title(' Received Constellation');
 xlabel('In-phase'); ylabel('Qudrature-phase');
-Demod_out = demodulator(final_sym_vec,mod_type,1);
+
+% Choose demod method according to MOD_ORDER
+switch MOD_ORDER
+    case 1 % BPSK
+        demod_idx = pskdemod(final_sym_vec, 2, pi);
+    case 2 % QPSK
+        demod_idx = pskdemod(final_sym_vec, 4, pi/4);
+    otherwise % M-QAM
+        demod_idx = qamdemod(final_sym_vec, M, 'gray', 'UnitAveragePower', true);
+end
+
+% convert symbol indices to bits (row-major)
+demod_bits_mat = de2bi(demod_idx, MOD_ORDER, 'left-msb'); % rows = symbols
+demod_bits = reshape(demod_bits_mat.', 1, []);             % row vector bits
+
+% Trim to original coded bit length (tx_code length)
+demod_bits = demod_bits(1:length(tx_code));  % tx_code is coded bits length
+
+% produce hard-decisions 0/1 for Viterbi input
+Demod_out = uint8(demod_bits(:));  % column vector expected by vitdec
+
+%% Viterbi decode
 rx_data_viterbi_dec = vitdec(Demod_out,trel,7,'trunc','hard'); %truncated operating mode and hard decoding
 [num_err_bits,ber] = biterr(tx_data,rx_data_viterbi_dec);
+disp('BER:');
 disp(ber);
-disp(num_err_bits)
+disp('Number of bit errors:');
+disp(num_err_bits);
